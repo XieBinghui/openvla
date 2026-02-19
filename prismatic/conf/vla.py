@@ -78,8 +78,8 @@ class Exp_SigLIP_224px_Bridge(VLAConfig):
     epochs: int = 1000
     max_steps: Optional[int] = None
 
-    expected_world_size: int = 8
-    global_batch_size: int = 256
+    expected_world_size: int = 7
+    global_batch_size: int = 224
     per_device_batch_size: int = 32
 
     learning_rate: float = 2e-5
