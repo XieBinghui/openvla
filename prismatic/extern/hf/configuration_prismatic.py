@@ -112,6 +112,9 @@ class PrismaticConfig(PretrainedConfig):
         self.image_resize_strategy = image_resize_strategy
 
         self.hf_llm_id = LLM_BACKBONE_TO_HF_PATH[self.llm_backbone_id]
+        print("[PrismaticConfig] llm_backbone_id =", self.llm_backbone_id, flush=True)
+        print("[PrismaticConfig] hf_llm_id =", self.hf_llm_id, flush=True)
+        assert False
         self.llm_max_length = llm_max_length
         self.pad_token_id, self.pad_to_multiple_of = pad_token_id, pad_to_multiple_of
 
