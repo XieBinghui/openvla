@@ -17,6 +17,18 @@ from tqdm import tqdm
 
 from prismatic.overwatch import initialize_overwatch
 
+import time
+import torch.distributed as dist
+
+def _is_dist():
+    return dist.is_available() and dist.is_initialized()
+
+def _rank():
+    return dist.get_rank() if _is_dist() else 0
+
+def _world():
+    return dist.get_world_size() if _is_dist() else 1
+
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
@@ -183,7 +195,7 @@ def pprint_data_mixture(dataset_kwargs_list: List[Dict[str, Any]], dataset_weigh
 
 
 def get_dataset_statistics(
-    dataset: dl.DLataset,
+    dataset: "dl.DLataset",
     hash_dependencies: Tuple[str, ...],
     save_dir: Optional[str] = None,
 ) -> Dict:
@@ -191,36 +203,103 @@ def get_dataset_statistics(
     Either computes the statistics of a dataset or loads them from a cache file if this function has been called before
     with the same `hash_dependencies`.
 
-    Currently, the statistics include the min/max/mean/std of the actions and proprio as well as the number of
-    transitions and trajectories in the dataset.
+    Rank0-only behavior (for torchrun/DDP):
+      - rank0 computes + writes cache
+      - other ranks wait for cache file then load it
+
+    Statistics include min/max/mean/std/quantiles of actions & proprio, plus transition/trajectory counts.
     """
-    unique_hash = hashlib.sha256("".join(hash_dependencies).encode("utf-8"), usedforsecurity=False).hexdigest()
+    # -------------------------
+    # helpers for distributed
+    # -------------------------
+    def dist_is_initialized() -> bool:
+        return dist is not None and dist.is_available() and dist.is_initialized()
+
+    def get_rank() -> int:
+        return dist.get_rank() if dist_is_initialized() else 0
+
+    def barrier() -> None:
+        if dist_is_initialized():
+            dist.barrier()
+
+    rank = get_rank()
+
+    # -------------------------
+    # resolve cache paths
+    # -------------------------
+    unique_hash = hashlib.sha256(
+        "".join(hash_dependencies).encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()
 
     # Fallback local path for when data_dir is not writable or not provided
-    local_path = os.path.expanduser(os.path.join("~", ".cache", "orca", f"dataset_statistics_{unique_hash}.json"))
+    local_path = os.path.expanduser(
+        os.path.join("~", ".cache", "orca", f"dataset_statistics_{unique_hash}.json")
+    )
+
     if save_dir is not None:
         path = tf.io.gfile.join(save_dir, f"dataset_statistics_{unique_hash}.json")
     else:
         path = local_path
 
-    # check if cache file exists and load
+    # -------------------------
+    # fast path: load cache
+    # -------------------------
+    def load_from_path(p: str) -> Dict:
+        overwatch.info(f"Loading existing dataset statistics from {p}.")
+        with tf.io.gfile.GFile(p, "r") as f:
+            return json.load(f)
+
+    # First try shared path (gfile) then local_path (posix)
     if tf.io.gfile.exists(path):
-        overwatch.info(f"Loading existing dataset statistics from {path}.")
-        with tf.io.gfile.GFile(path, "r") as f:
-            metadata = json.load(f)
-        return metadata
+        return load_from_path(path)
 
     if os.path.exists(local_path):
         overwatch.info(f"Loading existing dataset statistics from {local_path}.")
         with open(local_path, "r") as f:
-            metadata = json.load(f)
-        return metadata
+            return json.load(f)
+
+    # -------------------------
+    # DDP: non-rank0 waits
+    # -------------------------
+    if dist_is_initialized() and rank != 0:
+        overwatch.info(
+            f"[rank {rank}] Dataset statistics cache not found yet. Waiting for rank0 to compute it..."
+        )
+
+        # Prefer waiting for the shared `path` (save_dir). If save_dir is None, `path==local_path`.
+        # We also check local_path as a fallback, but ideally all ranks see `path`.
+        while True:
+            if tf.io.gfile.exists(path):
+                break
+            if os.path.exists(local_path):
+                # This might help in single-node setups even if save_dir is unwritable
+                break
+            time.sleep(2.0)
+
+        barrier()
+
+        if tf.io.gfile.exists(path):
+            return load_from_path(path)
+
+        # fallback
+        overwatch.info(f"[rank {rank}] Loading existing dataset statistics from {local_path}.")
+        with open(local_path, "r") as f:
+            return json.load(f)
+
+    # -------------------------
+    # rank0 computes statistics
+    # -------------------------
+    if dist_is_initialized():
+        overwatch.info(f"[rank {rank}] Computing dataset statistics (rank0-only).")
 
     dataset = dataset.traj_map(
         lambda traj: {
             "action": traj["action"],
             "proprio": (
-                traj["observation"]["proprio"] if "proprio" in traj["observation"] else tf.zeros_like(traj["action"])
+                traj["observation"]["proprio"]
+                if "proprio" in traj["observation"]
+                else tf.zeros_like(traj["action"])
             ),
         }
     )
@@ -229,15 +308,23 @@ def get_dataset_statistics(
     if cardinality == tf.data.INFINITE_CARDINALITY:
         raise ValueError("Cannot compute dataset statistics for infinite datasets.")
 
-    overwatch.info("Computing dataset statistics. This may take a bit, but should only need to happen once.")
+    overwatch.info(
+        "Computing dataset statistics. This may take a bit, but should only need to happen once."
+    )
+
     actions, proprios, num_transitions, num_trajectories = [], [], 0, 0
-    for traj in tqdm(dataset.iterator(), total=cardinality if cardinality != tf.data.UNKNOWN_CARDINALITY else None):
+    for traj in tqdm(
+        dataset.iterator(),
+        total=cardinality if cardinality != tf.data.UNKNOWN_CARDINALITY else None,
+    ):
         actions.append(traj["action"])
         proprios.append(traj["proprio"])
         num_transitions += traj["action"].shape[0]
         num_trajectories += 1
 
-    actions, proprios = np.concatenate(actions), np.concatenate(proprios)
+    actions = np.concatenate(actions)
+    proprios = np.concatenate(proprios)
+
     metadata = {
         "action": {
             "mean": actions.mean(0).tolist(),
@@ -259,15 +346,42 @@ def get_dataset_statistics(
         "num_trajectories": num_trajectories,
     }
 
-    try:
-        with tf.io.gfile.GFile(path, "w") as f:
-            json.dump(metadata, f)
-    except tf.errors.PermissionDeniedError:
-        overwatch.warning(f"Could not write dataset statistics to {path}. Writing to {local_path} instead.")
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        with open(local_path, "w") as f:
-            json.dump(metadata, f)
+    # -------------------------
+    # write cache (atomic)
+    # -------------------------
+    def atomic_write_json_gfile(dst: str, obj: Dict) -> None:
+        tmp = f"{dst}.tmp.rank{rank}.pid{os.getpid()}"
+        with tf.io.gfile.GFile(tmp, "w") as f:
+            json.dump(obj, f)
+        tf.io.gfile.rename(tmp, dst, overwrite=True)
 
+    wrote_shared = False
+    try:
+        # Try writing to shared path first
+        atomic_write_json_gfile(path, metadata)
+        wrote_shared = True
+        overwatch.info(f"Wrote dataset statistics to {path}.")
+    except tf.errors.PermissionDeniedError:
+        overwatch.warning(
+            f"Could not write dataset statistics to {path} (permission denied). "
+            f"Writing to {local_path} instead."
+        )
+    except Exception as e:
+        overwatch.warning(
+            f"Could not write dataset statistics to {path} (error: {type(e).__name__}: {e}). "
+            f"Writing to {local_path} instead."
+        )
+
+    if not wrote_shared:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        # local atomic write
+        tmp = f"{local_path}.tmp.rank{rank}.pid{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(metadata, f)
+        os.replace(tmp, local_path)
+        overwatch.info(f"Wrote dataset statistics to {local_path}.")
+
+    barrier()
     return metadata
 
 
